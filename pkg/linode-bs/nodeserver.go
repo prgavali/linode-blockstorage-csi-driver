@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -89,48 +90,53 @@ func (ns *LinodeNodeServer) NodePublishVolume(ctx context.Context, req *csi.Node
 		*/
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
-
-	if err := os.MkdirAll(targetPath, os.FileMode(0755)); err != nil {
-		glog.Errorf("mkdir failed on disk %s (%v)", targetPath, err)
-		return nil, err
-	}
-
 	// Perform a bind mount to the full path to allow duplicate mounts of the same PD.
 	options := []string{"bind"}
 	if readOnly {
 		options = append(options, "ro")
 	}
 
-	err = ns.Mounter.Interface.Mount(stagingTargetPath, targetPath, "ext4", options)
-	if err != nil {
-		notMnt, mntErr := ns.Mounter.Interface.IsLikelyNotMountPoint(targetPath)
-		if mntErr != nil {
-			glog.Errorf("IsLikelyNotMountPoint check failed: %v", mntErr)
-			return nil, status.Error(codes.Internal, fmt.Sprintf("NodePublishVolume failed to check whether target path is a mount point: %v", err))
+	if blk := volumeCapability.GetBlock(); blk != nil {
+		respBlock, errBlock := ns.processMountForBlock(req, stagingTargetPath, targetPath, volumeID, options)
+		return respBlock, errBlock
+	} else {
+
+		if err := os.MkdirAll(targetPath, os.FileMode(0755)); err != nil {
+			glog.Errorf("mkdir failed on disk %s (%v)", targetPath, err)
+			return nil, err
 		}
-		if !notMnt {
-			if mntErr = ns.Mounter.Interface.Unmount(targetPath); mntErr != nil {
-				glog.Errorf("Failed to unmount: %v", mntErr)
-				return nil, status.Error(codes.Internal, fmt.Sprintf("NodePublishVolume failed to unmount target path: %v", err))
-			}
+
+		err = ns.Mounter.Interface.Mount(stagingTargetPath, targetPath, "ext4", options)
+		if err != nil {
 			notMnt, mntErr := ns.Mounter.Interface.IsLikelyNotMountPoint(targetPath)
 			if mntErr != nil {
 				glog.Errorf("IsLikelyNotMountPoint check failed: %v", mntErr)
 				return nil, status.Error(codes.Internal, fmt.Sprintf("NodePublishVolume failed to check whether target path is a mount point: %v", err))
 			}
 			if !notMnt {
-				// This is very odd, we don't expect it.  We'll try again next sync loop.
-				glog.Errorf("%s is still mounted, despite call to unmount().  Will try again next sync loop.", targetPath)
-				return nil, status.Error(codes.Internal, fmt.Sprintf("NodePublishVolume something is wrong with mounting: %v", err))
+				if mntErr = ns.Mounter.Interface.Unmount(targetPath); mntErr != nil {
+					glog.Errorf("Failed to unmount: %v", mntErr)
+					return nil, status.Error(codes.Internal, fmt.Sprintf("NodePublishVolume failed to unmount target path: %v", err))
+				}
+				notMnt, mntErr := ns.Mounter.Interface.IsLikelyNotMountPoint(targetPath)
+				if mntErr != nil {
+					glog.Errorf("IsLikelyNotMountPoint check failed: %v", mntErr)
+					return nil, status.Error(codes.Internal, fmt.Sprintf("NodePublishVolume failed to check whether target path is a mount point: %v", err))
+				}
+				if !notMnt {
+					// This is very odd, we don't expect it.  We'll try again next sync loop.
+					glog.Errorf("%s is still mounted, despite call to unmount().  Will try again next sync loop.", targetPath)
+					return nil, status.Error(codes.Internal, fmt.Sprintf("NodePublishVolume something is wrong with mounting: %v", err))
+				}
 			}
+			os.Remove(targetPath)
+			glog.Errorf("Mount of disk %s failed: %v", targetPath, err)
+			return nil, status.Error(codes.Internal, fmt.Sprintf("NodePublishVolume mount of disk failed: %v", err))
 		}
-		os.Remove(targetPath)
-		glog.Errorf("Mount of disk %s failed: %v", targetPath, err)
-		return nil, status.Error(codes.Internal, fmt.Sprintf("NodePublishVolume mount of disk failed: %v", err))
-	}
 
-	glog.V(4).Infof("Successfully mounted %s", targetPath)
-	return &csi.NodePublishVolumeResponse{}, nil
+		glog.V(4).Infof("Successfully mounted %s", targetPath)
+		return &csi.NodePublishVolumeResponse{}, nil
+	}
 }
 
 func getMountSources(target string) ([]string, error) {
@@ -259,8 +265,8 @@ func (ns *LinodeNodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeSt
 		}
 		options = append(options, mnt.MountFlags...)
 	} else if blk := volumeCapability.GetBlock(); blk != nil {
-		// TODO(#64): Block volume support
-		return nil, status.Error(codes.Unimplemented, "Block volume support is not yet implemented")
+		glog.V(4).Info("Since it is a block device request, return raw device without format and mount", "devicePath", devicePath)
+		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
 	fmtAndMountSource := devicePath
@@ -344,6 +350,64 @@ func closeMountSources(path string) error {
 	}
 
 	return nil
+}
+
+// This will handle raw block volume mounts
+// Incase of RAW volume mount, the Target will be devicefilepath  and NOT a mount directory.
+// The mountType is "bind" mount and will not specify any FORMAT(e.g ext4, ext3..)
+// e.g SOURCE (volume provider attached device on Host): /dev/xvde
+// e.g TARGET (SoftLink to User defined POD device /dev/sda) : "/var/data/kubelet/plugins/kubernetes.io/csi/volumeDevices/publish/pvc-9b82dced-fcd6-4181-968e-ae269e0f2311"
+func (ns *LinodeNodeServer) processMountForBlock(req *csi.NodePublishVolumeRequest, stagingTargetPath, target, volumeID string, options []string) (*csi.NodePublishVolumeResponse, error) {
+	glog.V(4).Info("processMountForBlock volumeID(%s), target(%s), options(%s)", volumeID, target, options)
+
+	key, err := common.ParseLinodeVolumeKey(volumeID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Part 1: Get device path of attached device
+	partition := ""
+
+	if part, ok := req.GetVolumeContext()["partition"]; ok {
+		partition = part
+	}
+
+	deviceName := key.GetNormalizedLabel()
+	devicePaths := ns.DeviceUtils.GetDiskByIdPaths(deviceName, partition)
+	devicePath, err := ns.DeviceUtils.VerifyDevicePath(devicePaths)
+
+	targetDir := filepath.Dir(target)
+	exists, err := mount.PathExists(targetDir)
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("Target Path Check failed %v", err))
+	}
+
+	if !exists {
+		if err := MakeDir(targetDir); err != nil {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("Target Path creation failed  %v", err))
+		}
+	}
+
+	// Create the mount point as a file since bind mount device node requires it to be a file
+	glog.V(4).Info("Making target file (%s)", target)
+	err = MakeFile(target)
+	if err != nil {
+		if removeErr := os.Remove(target); removeErr != nil {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("Remove mount target(%s) failed  %v", target, err))
+		}
+		return nil, status.Error(codes.Internal, fmt.Sprintf("Create mount target(%s) failed  %v", target, err))
+	}
+
+	glog.V(4).Info("Mounting source (%s)  to target (%s)", devicePath, target)
+	if err := ns.Mounter.Mount(devicePath, target, "", options); err != nil {
+		if removeErr := os.Remove(target); removeErr != nil {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("Remove mount target(%s) failed  %v", target, err))
+		}
+		return nil, status.Error(codes.Internal, fmt.Sprintf("Mount failed source(%s) target(%s) failed  %v", devicePath, target, err))
+	}
+
+	glog.V(4).Info("Block volume mounted successfully source (%s)  to target (%s)", devicePath, target)
+	return &csi.NodePublishVolumeResponse{}, nil
 }
 
 func (ns *LinodeNodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {

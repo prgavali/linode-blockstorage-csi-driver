@@ -5,6 +5,7 @@ package linodebs
 import (
 	"context"
 	"errors"
+	"os"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"golang.org/x/sys/unix"
@@ -43,4 +44,28 @@ func nodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest)
 			},
 		},
 	}, nil
+}
+
+func MakeFile(path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE, os.FileMode(0644))
+	if err != nil {
+		if !os.IsExist(err) {
+			return err
+		}
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// MakeDir creates a new directory.
+func MakeDir(path string) error {
+	err := os.MkdirAll(path, os.FileMode(0755))
+	if err != nil {
+		if !os.IsExist(err) {
+			return err
+		}
+	}
+	return nil
 }
